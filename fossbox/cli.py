@@ -1,4 +1,12 @@
 # fossbox/cli.py
+# --- ADD THESE IMPORTS AT THE TOP IF NOT ALREADY PRESENT ---
+import os           # work with environment variables (we'll set TMPDIR)
+import shutil       # copy files + delete directories
+import subprocess   # run external commands (like nmap)
+import tempfile     # create a unique temporary directory
+import uuid         # generate a short unique run ID to tag files
+import glob         # expand patterns like "*.xml"
+from pathlib import Path  # safer path handling than plain strings
 import typer
 
 # Create the CLI app (container for subcommands)
