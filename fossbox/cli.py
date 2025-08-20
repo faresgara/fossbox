@@ -9,6 +9,7 @@ import glob         # expand patterns like "*.xml"
 from pathlib import Path  # safer path handling than plain strings
 import typer
 
+
 # Create the CLI app (container for subcommands)
 app = typer.Typer(help="Fossbox CLI")
 
