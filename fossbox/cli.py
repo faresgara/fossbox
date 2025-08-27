@@ -44,21 +44,27 @@ def run(
     # Resource limit options (stability)
     cpus: float = typer.Option(
         1.0,
-        help="CPUs to allocate (e.g., --cpus 2 gives CPUQuota=200%)."
+        help="CPUs to allocate (e.g., --cpus 2 gives CPUQuota=200%).",
     ),
     ram: str = typer.Option(
         "1G",
-        help="Hard RAM cap, systemd format (e.g., 512M, 1G, 2G)."
+        help="Hard RAM cap, systemd format (e.g., 512M, 1G, 2G).",
     ),
     timeout: int = typer.Option(
         0,
-        help="Auto-kill after N seconds (0 = no timeout)."
+        help="Auto-kill after N seconds (0 = no timeout).",
     ),
 
     # Speed mode (fast tmp)
     tmpfs: str = typer.Option(
         "",
-        help="Mount a RAM-backed /tmp of this SIZE inside the run (e.g., 500M, 1G). Speeds up temp-file-heavy tools."
+        help="Mount a RAM-backed /tmp of this SIZE inside the run (e.g., 500M, 1G). Speeds up temp-file-heavy tools.",
+    ),
+    # Privilege options
+    as_root: bool = typer.Option(
+        False,
+        "--as-root",
+        help="Run the command as root (requires invoking fossbox as root).",
     ),
 
     # Artifact options
@@ -68,7 +74,7 @@ def run(
     ),
     out: Path = typer.Option(
         Path.cwd(),
-        help="Folder where matched files (from --save) will be copied."
+        help="Folder where matched files (from --save) will be copied.",
     ),
 ):
     """
@@ -90,6 +96,9 @@ def run(
 
       4) Speed mode (RAM-backed /tmp):
          python -m fossbox run --tmpfs 256M -- echo "hi fast tmp"
+
+      5) Run the unit as root (requires sudo):
+         sudo python -m fossbox run --as-root -- id -u
     """
 
     # 1) Collect the user's command (everything after `--`)
@@ -97,6 +106,10 @@ def run(
         typer.echo("Error: no command provided. Put your command after `--`.", err=True)
         raise typer.Exit(code=2)
     user_cmd = ctx.args[:]  # exact tokens the user typed
+
+    if as_root and os.geteuid() != 0:
+        typer.echo("Error: --as-root requires running fossbox as root.", err=True)
+        raise typer.Exit(code=1)
 
     # 2) Create an isolated workspace (unique temp folder)
     run_id = str(uuid.uuid4())[:8]  # short unique ID
@@ -130,9 +143,10 @@ def run(
     #   B) no tmpfs        -> transient SCOPE (previous behavior)
     if use_systemd and tmpfs:
         # Transient service to get a RAM-backed /tmp with a SIZE cap.
-        sd_cmd = [
-            "systemd-run",
-            "--user",
+        sd_cmd = ["systemd-run"]
+        if not as_root:
+            sd_cmd.append("--user")
+        sd_cmd += [
             "--unit", f"fossbox-{run_id}",
             "--wait",
             "--collect",
@@ -140,7 +154,7 @@ def run(
             "-p", f"CPUQuota={cpu_quota}",
             # Make /tmp private AND RAM-backed with size cap (the speed boost):
             "-p", "PrivateTmp=yes",
-            f"-p", f"TemporaryFileSystem=/tmp:rw,size={tmpfs}",
+            "-p", f"TemporaryFileSystem=/tmp:rw,size={tmpfs}",
             # Run inside our workspace and nudge tools to use /tmp:
             "-p", f"WorkingDirectory={work_dir}",
             "-p", "Environment=TMPDIR=/tmp",
@@ -155,9 +169,10 @@ def run(
         use_env = None   # Environment handled by systemd (TMPDIR=/tmp)
     elif use_systemd:
         # Previous behavior: transient scope (no tmpfs mount)
-        sd_cmd = [
-            "systemd-run",
-            "--user",
+        sd_cmd = ["systemd-run"]
+        if not as_root:
+            sd_cmd.append("--user")
+        sd_cmd += [
             "--scope",
             "-p", f"MemoryMax={ram}",
             "-p", f"CPUQuota={cpu_quota}",
