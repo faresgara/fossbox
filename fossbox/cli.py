@@ -1,10 +1,11 @@
-import os           # work with environment variables (we'll set TMPDIR)
-import shutil       # copy files + delete directories
-import subprocess   # run external commands (like nmap)
-import tempfile     # create a unique temporary directory
-import uuid         # generate a short unique run ID to tag files
-import glob         # expand patterns like "*.xml"
-from pathlib import Path  # safer path handling than plain strings
+# fossbox/cli.py
+import os
+import shutil
+import subprocess
+import tempfile
+import uuid
+import glob
+from pathlib import Path
 import typer
 
 # Create the CLI app (container for subcommands)
@@ -55,11 +56,12 @@ def run(
         help="Auto-kill after N seconds (0 = no timeout).",
     ),
 
-    # Speed mode (fast tmp)
+    # Speed mode (fast workspace on RAM)
     tmpfs: str = typer.Option(
         "",
-        help="Mount a RAM-backed /tmp of this SIZE inside the run (e.g., 500M, 1G). Speeds up temp-file-heavy tools.",
+        help="Mount the WORKSPACE as a RAM disk of SIZE (e.g., 500M, 1G). Speeds up temp-file-heavy tools.",
     ),
+
     # Privilege options
     as_root: bool = typer.Option(
         False,
@@ -70,7 +72,7 @@ def run(
     # Artifact options
     save: str = typer.Option(
         "",
-        help='Comma-separated globs to copy out from the sandbox, e.g., "*.xml,*.gnmap".'
+        help='Comma-separated globs (relative to the workspace) to copy out, e.g., "out/*,*.xml".'
     ),
     out: Path = typer.Option(
         Path.cwd(),
@@ -94,7 +96,7 @@ def run(
            --save "*.xml,*.gnmap" -- \
            nmap -T4 -sV -O 192.168.1.0/24 -oA scan
 
-      4) Speed mode (RAM-backed /tmp):
+      4) Speed mode (RAM-backed workspace):
          python -m fossbox run --tmpfs 256M -- echo "hi fast tmp"
 
       5) Run the unit as root (requires sudo):
@@ -114,9 +116,9 @@ def run(
     # 2) Create an isolated workspace (unique temp folder)
     run_id = str(uuid.uuid4())[:8]  # short unique ID
 
-    # ★ CHANGED: choose workspace root.
-    # - Normal mode: keep using system temp (/tmp).
-    # - Speed mode (--tmpfs): DO NOT use /tmp because PrivateTmp will hide it from the service.
+    # Workspace root:
+    # - Normal mode: use system temp (/tmp or platform temp)
+    # - Speed mode (--tmpfs): create under ~/.cache/fossbox/runs (stable path for systemd to mount)
     if tmpfs:
         runs_root = Path.home() / ".cache" / "fossbox" / "runs"
         runs_root.mkdir(parents=True, exist_ok=True)
@@ -139,10 +141,10 @@ def run(
     use_systemd = _has_systemd_run()
 
     # Two launch modes:
-    #   A) tmpfs requested -> transient SERVICE (TemporaryFileSystem)
+    #   A) tmpfs requested -> transient SERVICE (TemporaryFileSystem mounted on the workspace)
     #   B) no tmpfs        -> transient SCOPE (previous behavior)
     if use_systemd and tmpfs:
-        # Transient service to get a RAM-backed /tmp with a SIZE cap.
+        # Transient service: RAM-backed *workspace* with a size cap.
         sd_cmd = ["systemd-run"]
         if not as_root:
             sd_cmd.append("--user")
@@ -152,23 +154,20 @@ def run(
             "--collect",
             "-p", f"MemoryMax={ram}",
             "-p", f"CPUQuota={cpu_quota}",
-            # Make /tmp private AND RAM-backed with size cap (the speed boost):
-            "-p", "PrivateTmp=yes",
-            "-p", f"TemporaryFileSystem=/tmp:rw,size={tmpfs}",
-            # Run inside our workspace and nudge tools to use /tmp:
+            # Mount tmpfs directly on the workspace path and prefer it for TMPDIR
+            "-p", f"TemporaryFileSystem={work_dir}:rw,size={tmpfs}",
             "-p", f"WorkingDirectory={work_dir}",
-            "-p", "Environment=TMPDIR=/tmp",
+            "-p", f"Environment=TMPDIR={work_dir}",
         ]
-        # ★ CHANGED: only add RuntimeMaxSec if a timeout was requested
         if timeout > 0:
             sd_cmd += ["-p", f"RuntimeMaxSec={timeout}"]
 
         full_cmd = sd_cmd + ["--"] + user_cmd
-        launch_mode = f"systemd (service) with tmpfs /tmp={tmpfs}"
+        launch_mode = f"systemd (service) with tmpfs on workspace size={tmpfs}"
         use_cwd = None   # WorkingDirectory handled by systemd
-        use_env = None   # Environment handled by systemd (TMPDIR=/tmp)
+        use_env = None   # Environment handled by systemd
     elif use_systemd:
-        # Previous behavior: transient scope (no tmpfs mount)
+        # Transient scope (no tmpfs mount)
         sd_cmd = ["systemd-run"]
         if not as_root:
             sd_cmd.append("--user")
@@ -195,7 +194,7 @@ def run(
         typer.echo(f"[fossbox] workspace: {work_dir}")
         typer.echo(f"[fossbox] limits: cpus={cpus} (CPUQuota={cpu_quota}), ram={ram}, timeout={timeout or 'none'}")
         if tmpfs:
-            typer.echo(f"[fossbox] speed mode: tmpfs /tmp with size={tmpfs}")
+            typer.echo(f"[fossbox] speed mode: tmpfs on workspace with size={tmpfs}")
         typer.echo(f"[fossbox] launching via: {launch_mode} …")
 
         # 7) Run the command (blocking until it finishes)
@@ -207,7 +206,7 @@ def run(
         else:
             typer.echo(f"[fossbox] command exited with code {rc}", err=True)
 
-        # 8) Copy artifacts matching --save
+        # 8) Copy artifacts matching --save (patterns are relative to the workspace)
         patterns = [p.strip() for p in (save.split(",") if save else []) if p.strip()]
         copied = 0
         for pat in patterns:
