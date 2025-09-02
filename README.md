@@ -99,7 +99,7 @@ python -m fossbox run --tmpfs 512M --save "results.txt" -- \
 ```
 
 * Mounts a 512 MB RAM disk at `/tmp` inside workspace
-* May improve performance for tools that create lots of temporary files
+* Improve performance for tools that create lots of temporary files
 
 ---
 

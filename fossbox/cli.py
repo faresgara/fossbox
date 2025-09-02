@@ -11,7 +11,7 @@ import typer
 # Create the CLI app (container for subcommands)
 app = typer.Typer(help="Fossbox CLI")
 
-# ---- Demo subcommands (Typer basics) ----
+# ---- Demo subcommands ----
 @app.command()
 def hello(name: str = "World"):
     """Say hello to someone."""
@@ -80,7 +80,6 @@ def run(
     ),
 ):
     """
-    Run any command in a disposable workspace, copy selected outputs, enforce limits, then clean up.
 
     IMPORTANT: put your command AFTER `--` so Typer stops parsing flags.
     Examples:
@@ -92,7 +91,7 @@ def run(
            bash -lc 'echo hi > report.txt'
 
       3) With limits + save nmap outputs:
-         python -m fossbox run --cpus 2 --ram 1G --timeout 60 \
+         python -m fossbox run --as-root --cpus 2 --ram 1G --timeout 60 \
            --save "*.xml,*.gnmap" -- \
            nmap -T4 -sV -O 192.168.1.0/24 -oA scan
 
@@ -100,10 +99,10 @@ def run(
          python -m fossbox run --tmpfs 256M -- echo "hi fast tmp"
 
       5) Run the unit as root (requires sudo):
-         sudo python -m fossbox run --as-root -- id -u
+         sudo python -m fossbox run --as-root -- ...
     """
 
-    # 1) Collect the user's command (everything after `--`)
+    # 1) Collect the user's command 
     if not ctx.args:
         typer.echo("Error: no command provided. Put your command after `--`.", err=True)
         raise typer.Exit(code=2)
@@ -113,8 +112,8 @@ def run(
         typer.echo("Error: --as-root requires running fossbox as root.", err=True)
         raise typer.Exit(code=1)
 
-    # 2) Create an isolated workspace (unique temp folder)
-    run_id = str(uuid.uuid4())[:8]  # short unique ID
+    # 2) Create an isolated workspace 
+    run_id = str(uuid.uuid4())[:8]  
 
     # Workspace root:
     # - Normal mode: use system temp (/tmp or platform temp)
@@ -142,7 +141,7 @@ def run(
 
     # Two launch modes:
     #   A) tmpfs requested -> transient SERVICE (TemporaryFileSystem mounted on the workspace)
-    #   B) no tmpfs        -> transient SCOPE (previous behavior)
+    #   B) no tmpfs        -> transient SCOPE 
     if use_systemd and tmpfs:
         # Transient service: RAM-backed *workspace* with a size cap.
         sd_cmd = ["systemd-run"]
@@ -180,7 +179,7 @@ def run(
             sd_cmd += ["-p", f"RuntimeMaxSec={timeout}"]
         full_cmd = sd_cmd + ["--"] + user_cmd
         launch_mode = "systemd (scope)"
-        use_cwd = work_dir  # change dir in our subprocess
+        use_cwd = work_dir  
         use_env = env       # TMPDIR points inside workspace
     else:
         # Fallback: no enforced limits, no tmpfs mount
@@ -235,7 +234,7 @@ def run(
         except Exception as e:
             typer.echo(f"[fossbox] cleanup warning: {e}", err=True)
 
-# Entry point: run the Typer app (so it can parse subcommands).
+# Entry point: 
 def main():
     app()
 
