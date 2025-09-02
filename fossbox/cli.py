@@ -1,18 +1,17 @@
 # fossbox/cli.py
-# --- ADD THESE IMPORTS AT THE TOP IF NOT ALREADY PRESENT ---
-import os           # work with environment variables (we'll set TMPDIR)
-import shutil       # copy files + delete directories
-import subprocess   # run external commands (like nmap)
-import tempfile     # create a unique temporary directory
-import uuid         # generate a short unique run ID to tag files
-import glob         # expand patterns like "*.xml"
-from pathlib import Path  # safer path handling than plain strings
+import os
+import shutil
+import subprocess
+import tempfile
+import uuid
+import glob
+from pathlib import Path
 import typer
 
 # Create the CLI app (container for subcommands)
 app = typer.Typer(help="Fossbox CLI")
 
-# Register a SUBCOMMAND named "hello"
+# ---- Demo subcommands ----
 @app.command()
 def hello(name: str = "World"):
     """Say hello to someone."""
@@ -23,8 +22,219 @@ def goodbye(name: str = "World"):
     """Say Goodbye to someone."""
     print(f"goodbye {name} 👋 from fossbox!")
 
-# Entry point: run the Typer app (so it can parse subcommands).
-# IMPORTANT: this should NOT call hello() directly.
+# ---- Helpers ----
+def _cpu_quota_from_cpus(cpus: float) -> str:
+    """
+    Convert --cpus (e.g., 2.0) into systemd CPUQuota percent string.
+    Example: 2.0 CPUs -> '200%'.
+    """
+    return f"{int(cpus * 100)}%"
+
+def _has_systemd_run() -> bool:
+    """
+    Check if 'systemd-run' exists for this user.
+    If not, we still run the command (but without hard limits) and warn the user.
+    """
+    return shutil.which("systemd-run") is not None
+
+# ---- Core command ----
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def run(
+    ctx: typer.Context,  # gives access to everything after `--`
+
+    # Resource limit options (stability)
+    cpus: float = typer.Option(
+        1.0,
+        help="CPUs to allocate (e.g., --cpus 2 gives CPUQuota=200%).",
+    ),
+    ram: str = typer.Option(
+        "1G",
+        help="Hard RAM cap, systemd format (e.g., 512M, 1G, 2G).",
+    ),
+    timeout: int = typer.Option(
+        0,
+        help="Auto-kill after N seconds (0 = no timeout).",
+    ),
+
+    # Speed mode (fast workspace on RAM)
+    tmpfs: str = typer.Option(
+        "",
+        help="Mount the WORKSPACE as a RAM disk of SIZE (e.g., 500M, 1G). Speeds up temp-file-heavy tools.",
+    ),
+
+    # Privilege options
+    as_root: bool = typer.Option(
+        False,
+        "--as-root",
+        help="Run the command as root (requires invoking fossbox as root).",
+    ),
+
+    # Artifact options
+    save: str = typer.Option(
+        "",
+        help='Comma-separated globs (relative to the workspace) to copy out, e.g., "out/*,*.xml".'
+    ),
+    out: Path = typer.Option(
+        Path.cwd(),
+        help="Folder where matched files (from --save) will be copied.",
+    ),
+):
+    """
+
+    IMPORTANT: put your command AFTER `--` so Typer stops parsing flags.
+    Examples:
+      1) Quick echo:
+         python -m fossbox run -- echo "hello"
+
+      2) Save a file:
+         python -m fossbox run --save "report.txt" -- \
+           bash -lc 'echo hi > report.txt'
+
+      3) With limits + save nmap outputs:
+         python -m fossbox run --as-root --cpus 2 --ram 1G --timeout 60 \
+           --save "*.xml,*.gnmap" -- \
+           nmap -T4 -sV -O 192.168.1.0/24 -oA scan
+
+      4) Speed mode (RAM-backed workspace):
+         python -m fossbox run --tmpfs 256M -- echo "hi fast tmp"
+
+      5) Run the unit as root (requires sudo):
+         sudo python -m fossbox run --as-root -- ...
+    """
+
+    # 1) Collect the user's command 
+    if not ctx.args:
+        typer.echo("Error: no command provided. Put your command after `--`.", err=True)
+        raise typer.Exit(code=2)
+    user_cmd = ctx.args[:]  # exact tokens the user typed
+
+    if as_root and os.geteuid() != 0:
+        typer.echo("Error: --as-root requires running fossbox as root.", err=True)
+        raise typer.Exit(code=1)
+
+    # 2) Create an isolated workspace 
+    run_id = str(uuid.uuid4())[:8]  
+
+    # Workspace root:
+    # - Normal mode: use system temp (/tmp or platform temp)
+    # - Speed mode (--tmpfs): create under ~/.cache/fossbox/runs (stable path for systemd to mount)
+    if tmpfs:
+        runs_root = Path.home() / ".cache" / "fossbox" / "runs"
+        runs_root.mkdir(parents=True, exist_ok=True)
+        base_dir = Path(tempfile.mkdtemp(prefix=f"fossbox-{run_id}-", dir=str(runs_root))).resolve()
+    else:
+        base_dir = Path(tempfile.mkdtemp(prefix=f"fossbox-{run_id}-")).resolve()
+
+    work_dir = (base_dir / "work")
+    out.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # 3) Hint many tools to use our workspace for temp files
+    env = os.environ.copy()
+    env["TMPDIR"] = str(work_dir)
+
+    # 4) Translate --cpus into systemd CPUQuota string
+    cpu_quota = _cpu_quota_from_cpus(cpus)
+
+    # 5) Build the final command we will execute (systemd-run if available)
+    use_systemd = _has_systemd_run()
+
+    # Two launch modes:
+    #   A) tmpfs requested -> transient SERVICE (TemporaryFileSystem mounted on the workspace)
+    #   B) no tmpfs        -> transient SCOPE 
+    if use_systemd and tmpfs:
+        # Transient service: RAM-backed *workspace* with a size cap.
+        sd_cmd = ["systemd-run"]
+        if not as_root:
+            sd_cmd.append("--user")
+        sd_cmd += [
+            "--unit", f"fossbox-{run_id}",
+            "--wait",
+            "--collect",
+            "-p", f"MemoryMax={ram}",
+            "-p", f"CPUQuota={cpu_quota}",
+            # Mount tmpfs directly on the workspace path and prefer it for TMPDIR
+            "-p", f"TemporaryFileSystem={work_dir}:rw,size={tmpfs}",
+            "-p", f"WorkingDirectory={work_dir}",
+            "-p", f"Environment=TMPDIR={work_dir}",
+        ]
+        if timeout > 0:
+            sd_cmd += ["-p", f"RuntimeMaxSec={timeout}"]
+
+        full_cmd = sd_cmd + ["--"] + user_cmd
+        launch_mode = f"systemd (service) with tmpfs on workspace size={tmpfs}"
+        use_cwd = None   # WorkingDirectory handled by systemd
+        use_env = None   # Environment handled by systemd
+    elif use_systemd:
+        # Transient scope (no tmpfs mount)
+        sd_cmd = ["systemd-run"]
+        if not as_root:
+            sd_cmd.append("--user")
+        sd_cmd += [
+            "--scope",
+            "-p", f"MemoryMax={ram}",
+            "-p", f"CPUQuota={cpu_quota}",
+        ]
+        if timeout and timeout > 0:
+            sd_cmd += ["-p", f"RuntimeMaxSec={timeout}"]
+        full_cmd = sd_cmd + ["--"] + user_cmd
+        launch_mode = "systemd (scope)"
+        use_cwd = work_dir  
+        use_env = env       # TMPDIR points inside workspace
+    else:
+        # Fallback: no enforced limits, no tmpfs mount
+        full_cmd = user_cmd
+        launch_mode = "direct (no hard limits)"
+        use_cwd = work_dir
+        use_env = env
+
+    try:
+        # 6) Status
+        typer.echo(f"[fossbox] workspace: {work_dir}")
+        typer.echo(f"[fossbox] limits: cpus={cpus} (CPUQuota={cpu_quota}), ram={ram}, timeout={timeout or 'none'}")
+        if tmpfs:
+            typer.echo(f"[fossbox] speed mode: tmpfs on workspace with size={tmpfs}")
+        typer.echo(f"[fossbox] launching via: {launch_mode} …")
+
+        # 7) Run the command (blocking until it finishes)
+        result = subprocess.run(full_cmd, cwd=use_cwd, env=use_env)
+        rc = result.returncode
+
+        if rc == 0:
+            typer.echo("[fossbox] command completed successfully.")
+        else:
+            typer.echo(f"[fossbox] command exited with code {rc}", err=True)
+
+        # 8) Copy artifacts matching --save (patterns are relative to the workspace)
+        patterns = [p.strip() for p in (save.split(",") if save else []) if p.strip()]
+        copied = 0
+        for pat in patterns:
+            for match in glob.glob(str(work_dir / pat), recursive=True):
+                src = Path(match)
+                if src.is_file():
+                    dest = out / src.name
+                    if dest.exists():
+                        dest = out / f"{src.stem}-{run_id}{src.suffix}"
+                    shutil.copy2(src, dest)
+                    copied += 1
+
+        if patterns:
+            typer.echo(f"[fossbox] saved {copied} file(s) to: {out}")
+        else:
+            typer.echo("[fossbox] no --save patterns provided; nothing copied out.")
+
+        # Exit with the same code as the user's command
+        raise typer.Exit(code=rc)
+
+    finally:
+        # 9) Cleanup sandbox (always)
+        try:
+            shutil.rmtree(base_dir)
+            typer.echo("[fossbox] cleaned up workspace.")
+        except Exception as e:
+            typer.echo(f"[fossbox] cleanup warning: {e}", err=True)
+
+# Entry point: 
 def main():
     app()
 
